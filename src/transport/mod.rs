@@ -32,3 +32,10 @@ pub(crate) async fn bind_udp_socket_with_large_rcvbuf() -> std::io::Result<tokio
     socket.bind(&"0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap().into())?;
     tokio::net::UdpSocket::from_std(socket.into())
 }
+
+/// The P2P MTU this client asks for and sends with: `REOLING_MTU` when set (576 to 1350), else 1350. A host whose
+/// network MTU is below 1378 (for example 1316 on some container platforms) loses the device's full-size packets,
+/// so that the login reply never arrives; a smaller value fixes that.
+pub fn p2p_mtu() -> u32 {
+    std::env::var("REOLING_MTU").ok().and_then(|v| v.parse::<u32>().ok()).map(|v| v.clamp(576, 1350)).unwrap_or(1350)
+}

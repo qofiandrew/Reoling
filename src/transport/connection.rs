@@ -17,7 +17,9 @@ use tokio::net::{TcpStream, UdpSocket};
 /// (`.plans/reoling-baichuan-p2p-audit-2026-09-16.md`) confirms 1330 is
 /// what it actually sends per fragment; this file previously used 1300, a
 /// plausible-looking number that was never checked against real traffic.
-const MAX_FRAGMENT_SIZE: usize = 1330;
+fn max_fragment_size() -> usize {
+    crate::transport::p2p_mtu() as usize - 20
+}
 
 /// Upper bound on how many entries an ack's missing-packet bitmap covers
 /// (see `build_ack_payload`) — a stray/malicious `packet_id` far ahead of
@@ -255,7 +257,7 @@ struct UdpSendState {
 /// enum is the only place that knows the difference.
 enum Socket {
     /// P2P (UID-resolved, direct or relay). Needs the `BcUdp` envelope:
-    /// fragmentation into `MAX_FRAGMENT_SIZE` chunks, ACKs, out-of-order
+    /// fragmentation into `max_fragment_size()` chunks, ACKs, out-of-order
     /// reassembly by `packet_id`, and a negotiated peer to validate
     /// incoming datagrams against. The actual receive/ack/resend/reorder
     /// work happens in a background task (`udp_rx_task`, spawned by
@@ -477,7 +479,7 @@ impl BcConnection {
                 // concurrent `resend_tick` can't retransmit a packet_id this
                 // loop hasn't finished inserting into `sent` yet.
                 let mut state = send_state.lock().await;
-                for chunk in bytes.chunks(MAX_FRAGMENT_SIZE) {
+                for chunk in bytes.chunks(max_fragment_size()) {
                     let packet = UdpData {
                         connection_id: peer.remote_connection_id,
                         packet_id: state.send_packet_id,
@@ -963,7 +965,7 @@ mod tests {
             PeerHandle { addr: addr_a, local_connection_id: 2, remote_connection_id: 1, nonce: None, is_direct: false },
         );
 
-        let big_payload = vec![0xABu8; 5000]; // several times MAX_FRAGMENT_SIZE
+        let big_payload = vec![0xABu8; 5000]; // several times max_fragment_size()
         let bc = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_VIDEO,
@@ -1149,7 +1151,7 @@ mod tests {
     /// dropped datagram would leave a gap and stop `pending` from growing).
     async fn flood_paced(sender: &UdpSocket, to: std::net::SocketAddr, count: u32) {
         for i in 0..count {
-            let packet = UdpData { connection_id: 2, packet_id: i, payload: vec![b'x'; MAX_FRAGMENT_SIZE] };
+            let packet = UdpData { connection_id: 2, packet_id: i, payload: vec![b'x'; max_fragment_size()] };
             sender.send_to(&write_bcudp(&BcUdp::Data(packet)), to).await.unwrap();
             if i % 8 == 7 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
