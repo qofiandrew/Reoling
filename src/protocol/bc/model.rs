@@ -27,6 +27,8 @@ pub const MSG_ID_PTZ: u32 = 18;
 /// PTZ Guard / "Monitor Point": sets, saves or moves to the saved home
 /// position (write) and reads its current state (read). See
 /// `.plans/reolink-baichuan-calibration-monitor-point.md`.
+/// An alarm-event push: the device sends its AlarmEventList under the subscription's number.
+pub const MSG_ID_ALARM_EVENT: u32 = 33;
 pub const MSG_ID_PTZ_GUARD: u32 = 331;
 pub const MSG_ID_GET_PTZ_GUARD: u32 = 332;
 /// Re-calibrates the pan/tilt mechanism.

@@ -128,6 +128,9 @@ pub enum DeviceUpdate {
     /// they were sent, with the caller's number for the group (see
     /// `write_settings`).
     SettingsWritten { target: SettingsTarget, group: u64, results: Vec<settings::WriteOutcome> },
+    /// An alarm-event push (33): the device's AlarmEventList XML as sent (motion, AI detections, visitor), for
+    /// callers that watch events. Reoling itself does not interpret it.
+    Alarm { channel_id: u8, xml: String },
 }
 
 /// What the device says it is, as reported after login.
@@ -212,6 +215,9 @@ pub struct ReolinkClient {
     /// during `identity`, while starting video, or mid-stream.
     channel_updates_tx: tokio::sync::mpsc::UnboundedSender<DeviceUpdate>,
     channel_updates_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeviceUpdate>>,
+    /// When `wait_for_pushes` last received a message from the device: proof that the session is alive, for
+    /// callers whose heartbeat must not be a local timer (see `received`).
+    received_tx: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
     /// AAC (ADTS) frames of the running stream's audio.
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -458,6 +464,15 @@ fn pushed_update(
     match settings::settings_reply(bc, pending_images) {
         settings::Routed::Consumed(update) => return update,
         settings::Routed::NotOurs => {}
+    }
+    if bc.meta.msg_id == MSG_ID_ALARM_EVENT {
+        if let BcBody::Modern(ModernMsg { payload: Some(payload), .. }) = &bc.body {
+            return Some(DeviceUpdate::Alarm {
+                channel_id: bc.meta.channel_id,
+                xml: String::from_utf8_lossy(payload).into_owned(),
+            });
+        }
+        return None;
     }
     if bc.meta.msg_id == MSG_ID_IMAGE_FILE || bc.meta.msg_id == MSG_ID_SNAP {
         if bc.meta.response_code == 0xffff {
@@ -758,6 +773,7 @@ impl ReolinkClient {
             direct_keepalive_task: None,
             channel_updates_tx,
             channel_updates_rx: Some(channel_updates_rx),
+            received_tx: tokio::sync::watch::channel(None).0,
             audio_tx,
             audio_rx: Some(audio_rx),
             pending_images: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -786,6 +802,11 @@ impl ReolinkClient {
     /// comes with its video, see `ReplayStream::units`). Can be taken once.
     pub fn take_audio(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
         self.audio_rx.take()
+    }
+
+    /// When `wait_for_pushes` last received any message from the device.
+    pub fn received(&self) -> tokio::sync::watch::Receiver<Option<tokio::time::Instant>> {
+        self.received_tx.subscribe()
     }
 
     /// The channel lists this device pushes, as they arrive. Can be taken
@@ -1908,6 +1929,7 @@ impl ReolinkClient {
             };
             match received {
                 Ok(Ok(bc)) => {
+                    let _ = self.received_tx.send(Some(tokio::time::Instant::now()));
                     if let Some(update) = pushed_update(&bc, &mut image_chunks, &self.pending_images, &self.channel_uids) {
                         let _ = self.channel_updates_tx.send(update);
                     }
@@ -2347,7 +2369,7 @@ mod keepalive_tests {
         device_message(MSG_ID_LINK_TYPE, msg_num, 200, None, Some(xml.as_bytes().to_vec()))
     }
 
-    /// An alarm-event push (33), which nothing in the client reads.
+    /// An alarm-event push (33), passed on as `DeviceUpdate::Alarm`.
     fn alarm_push() -> Bc {
         let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AlarmEventList version=\"1.1\">\n\
                    </AlarmEventList>\n</body>\n";
@@ -2460,6 +2482,30 @@ mod keepalive_tests {
             error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
             () = fake => {}
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_alarm_push_is_passed_on_and_any_message_marks_the_session_alive() {
+        let (mut client, mut device) = client_and_device().await;
+        let mut updates = client.take_channel_updates().unwrap();
+        let mut received = client.received();
+        assert!(received.borrow().is_none());
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n<AlarmEventList version=\"1.1\">\n\
+                   <AlarmEvent version=\"1.1\"><channelId>0</channelId><status>MD</status><AItype>people</AItype>\
+                   </AlarmEvent>\n</AlarmEventList>\n</body>\n";
+        let fake = async move {
+            device.send_bc(&device_message(33, 0, 200, None, Some(xml.as_bytes().to_vec())), &PLAIN).await.unwrap();
+            match updates.recv().await {
+                Some(DeviceUpdate::Alarm { channel_id: 0, xml: got }) => assert!(got.contains("<AItype>people</AItype>")),
+                other => panic!("expected the alarm, got {other:?}"),
+            }
+        };
+        tokio::select! {
+            error = client.wait_for_pushes() => panic!("wait_for_pushes ended: {error}"),
+            () = fake => {}
+        }
+        assert!(received.has_changed().unwrap());
+        assert!(received.borrow_and_update().is_some());
     }
 
     #[tokio::test(start_paused = true)]
